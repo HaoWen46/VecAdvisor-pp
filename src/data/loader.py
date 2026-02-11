@@ -1,0 +1,123 @@
+"""Dataset download and loading utilities for VecAdvisor++.
+
+Supports SIFT1M and other standard ANN benchmark datasets in fvecs/ivecs format.
+"""
+
+import os
+import struct
+import tarfile
+import urllib.request
+
+import numpy as np
+
+
+SIFT1M_URL = "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz"
+SIFT1M_FILENAME = "sift.tar.gz"
+
+
+def _read_fvecs(filepath: str) -> np.ndarray:
+    """Read vectors from fvecs format file.
+
+    fvecs format: each vector is stored as [dim (4 bytes int)] [dim floats (4 bytes each)].
+    """
+    vectors = []
+    with open(filepath, "rb") as f:
+        while True:
+            dim_bytes = f.read(4)
+            if not dim_bytes:
+                break
+            dim = struct.unpack("i", dim_bytes)[0]
+            vec = struct.unpack(f"{dim}f", f.read(dim * 4))
+            vectors.append(vec)
+    return np.array(vectors, dtype=np.float32)
+
+
+def _read_ivecs(filepath: str) -> np.ndarray:
+    """Read integer vectors from ivecs format file (used for ground truth indices)."""
+    vectors = []
+    with open(filepath, "rb") as f:
+        while True:
+            dim_bytes = f.read(4)
+            if not dim_bytes:
+                break
+            dim = struct.unpack("i", dim_bytes)[0]
+            vec = struct.unpack(f"{dim}i", f.read(dim * 4))
+            vectors.append(vec)
+    return np.array(vectors, dtype=np.int32)
+
+
+def download_sift1m(data_dir: str) -> None:
+    """Download and extract the SIFT1M dataset if not already present.
+
+    Args:
+        data_dir: Directory to store the dataset files.
+    """
+    os.makedirs(data_dir, exist_ok=True)
+
+    # Check if already extracted
+    sift_dir = os.path.join(data_dir, "sift")
+    if os.path.isdir(sift_dir) and os.path.isfile(
+        os.path.join(sift_dir, "sift_base.fvecs")
+    ):
+        print(f"SIFT1M dataset already exists at {sift_dir}")
+        return
+
+    archive_path = os.path.join(data_dir, SIFT1M_FILENAME)
+    if not os.path.isfile(archive_path):
+        print(f"Downloading SIFT1M from {SIFT1M_URL} ...")
+        urllib.request.urlretrieve(SIFT1M_URL, archive_path)
+        print("Download complete.")
+
+    print("Extracting SIFT1M archive ...")
+    with tarfile.open(archive_path, "r:gz") as tar:
+        tar.extractall(path=data_dir)
+    print(f"Extraction complete. Files at {sift_dir}")
+
+
+def load_sift1m(
+    data_dir: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load the SIFT1M dataset from disk.
+
+    Args:
+        data_dir: Root directory containing the extracted 'sift/' folder.
+
+    Returns:
+        Tuple of (base_vectors, query_vectors, ground_truth_ids):
+            - base_vectors: (1_000_000, 128) float32
+            - query_vectors: (10_000, 128) float32
+            - ground_truth_ids: (10_000, 100) int32 — true NN indices
+    """
+    sift_dir = os.path.join(data_dir, "sift")
+
+    base_vectors = _read_fvecs(os.path.join(sift_dir, "sift_base.fvecs"))
+    query_vectors = _read_fvecs(os.path.join(sift_dir, "sift_query.fvecs"))
+    ground_truth_ids = _read_ivecs(os.path.join(sift_dir, "sift_groundtruth.ivecs"))
+
+    print(
+        f"Loaded SIFT1M: base={base_vectors.shape}, "
+        f"queries={query_vectors.shape}, gt={ground_truth_ids.shape}"
+    )
+    return base_vectors, query_vectors, ground_truth_ids
+
+
+def load_subset(
+    base_vectors: np.ndarray,
+    query_vectors: np.ndarray,
+    n_base: int | None = None,
+    n_queries: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load a subset of the dataset for faster experimentation.
+
+    Args:
+        base_vectors: Full base vectors array.
+        query_vectors: Full query vectors array.
+        n_base: Number of base vectors to use (None = all).
+        n_queries: Number of query vectors to use (None = all).
+
+    Returns:
+        Tuple of (base_subset, query_subset).
+    """
+    base = base_vectors[:n_base] if n_base else base_vectors
+    queries = query_vectors[:n_queries] if n_queries else query_vectors
+    return base, queries

@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""CLI entry point for VecAdvisor++ benchmark suite.
+
+Runs end-to-end benchmarks comparing baseline configurations
+against VecAdvisor++ recommendations across multiple selectivity
+levels and k values.
+
+Usage:
+    python scripts/run_benchmark.py --config config/default.yaml \
+        --n-base 100000 --n-queries 500 --k 10
+
+    # Full sweep across k values and selectivities:
+    python scripts/run_benchmark.py --n-base 100000 --n-queries 500 --full-sweep
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import numpy as np
+import yaml
+
+from src.data.loader import download_sift1m, load_sift1m, load_subset
+from src.data.schema import (
+    create_vector_table,
+    generate_synthetic_attributes,
+    get_connection,
+    insert_vectors,
+)
+from src.ground_truth.compute import (
+    compute_filtered_ground_truth,
+    compute_ground_truth,
+)
+from src.benchmark.workload import (
+    build_filter_mask,
+    generate_filtered_queries,
+    generate_pure_queries,
+)
+from src.evaluation.compare import (
+    run_comparison,
+    summarize_comparison,
+)
+from src.evaluation.visualize import (
+    generate_all_plots,
+    plot_selectivity_heatmap,
+)
+from src.profiler.workload_profiler import profile_from_params
+
+
+# Selectivity configurations: (column, filter_value, label, approx_selectivity)
+SELECTIVITY_CONFIGS = [
+    ("category_10",   0, "~10%",  0.10),
+    ("category_100",  0, "~1%",   0.01),
+    ("category_1000", 0, "~0.1%", 0.001),
+]
+
+
+def load_config(config_path: str) -> dict:
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+def run_selectivity_benchmark(
+    conn_params, table_name, query_vectors, base_vectors,
+    attributes, k, n_queries, cache_mode, col, val, label, sel,
+):
+    """Run a single selectivity-level benchmark."""
+    mask = build_filter_mask(attributes, col, val)
+    actual_sel = mask.sum() / len(mask)
+    print(f"\n  Filter: {col} = {val} | Label: {label} | "
+          f"Actual selectivity: {actual_sel:.2%} ({mask.sum()}/{len(mask)})")
+
+    _, gt_ids = compute_filtered_ground_truth(base_vectors, query_vectors, mask, k)
+
+    queries = generate_filtered_queries(
+        query_vectors, table_name, k, col, val,
+        filter_mask=mask, num_queries=n_queries,
+    )
+
+    profile = profile_from_params(
+        n_vectors=len(base_vectors), dim=base_vectors.shape[1],
+        k=k, has_filters=True,
+        filter_selectivity=sel, filter_columns=[col],
+    )
+
+    results = run_comparison(
+        conn_params, table_name, queries, gt_ids,
+        k, profile, cache_mode=cache_mode,
+        filter_selectivity=sel,
+    )
+    print(summarize_comparison(results))
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="VecAdvisor++ Benchmark Suite"
+    )
+    parser.add_argument("--config", default="config/default.yaml",
+                        help="Config file path")
+    parser.add_argument("--n-base", type=int, default=10000,
+                        help="Number of base vectors to use")
+    parser.add_argument("--n-queries", type=int, default=100,
+                        help="Number of query vectors to use")
+    parser.add_argument("--k", type=int, default=10,
+                        help="Top-k parameter (used when --full-sweep is off)")
+    parser.add_argument("--table", default="vectors",
+                        help="Table name")
+    parser.add_argument("--cache-mode", choices=["cold", "warm"],
+                        default="warm", help="Cache mode")
+    parser.add_argument("--output-dir", default="results",
+                        help="Output directory for results")
+    parser.add_argument("--skip-load", action="store_true",
+                        help="Skip data loading (use existing table)")
+    parser.add_argument("--full-sweep", action="store_true",
+                        help="Run full sweep across k values and selectivities")
+
+    args = parser.parse_args()
+    config = load_config(args.config)
+    conn_params = config["database"]
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "plots"), exist_ok=True)
+
+    # Determine k values to test
+    if args.full_sweep:
+        k_values = config["benchmark"].get("k_values", [1, 10, 50, 100])
+    else:
+        k_values = [args.k]
+
+    # ================================================================
+    # Step 1: Load dataset
+    # ================================================================
+    print("=" * 60)
+    print("Step 1: Loading dataset")
+    print("=" * 60)
+    data_dir = config["dataset"]["data_dir"]
+    download_sift1m(data_dir)
+    base_vectors, query_vectors, _ = load_sift1m(data_dir)
+    base_vectors, query_vectors = load_subset(
+        base_vectors, query_vectors, args.n_base, args.n_queries
+    )
+    print(f"Using {len(base_vectors)} base vectors, {len(query_vectors)} queries")
+
+    # ================================================================
+    # Step 2: Load into PostgreSQL
+    # ================================================================
+    if not args.skip_load:
+        print("\n" + "=" * 60)
+        print("Step 2: Loading data into PostgreSQL")
+        print("=" * 60)
+        dim = base_vectors.shape[1]
+        conn = get_connection(conn_params)
+        try:
+            create_vector_table(conn, args.table, dim, with_attributes=True)
+            attributes = generate_synthetic_attributes(len(base_vectors))
+            insert_vectors(conn, args.table, base_vectors, attributes,
+                           batch_size=config["benchmark"]["batch_size"])
+            print(f"Inserted {len(base_vectors)} vectors into '{args.table}'")
+        finally:
+            conn.close()
+    else:
+        attributes = generate_synthetic_attributes(len(base_vectors))
+
+    all_results = []
+    results_by_selectivity = {}
+
+    for k in k_values:
+        print("\n" + "#" * 60)
+        print(f"# Benchmarking with k={k}")
+        print("#" * 60)
+
+        # ============================================================
+        # Step 3: Compute ground truth for this k
+        # ============================================================
+        print("\n" + "=" * 60)
+        print(f"Step 3: Computing ground truth (k={k})")
+        print("=" * 60)
+        _, gt_pure_ids = compute_ground_truth(base_vectors, query_vectors, k)
+        print(f"  Pure ground truth: {gt_pure_ids.shape}")
+
+        # ============================================================
+        # Step 4: Pure query benchmark
+        # ============================================================
+        print("\n" + "=" * 60)
+        print(f"Step 4: Pure query benchmark (k={k})")
+        print("=" * 60)
+        pure_queries = generate_pure_queries(
+            query_vectors, args.table, k, args.n_queries
+        )
+        pure_profile = profile_from_params(
+            n_vectors=len(base_vectors), dim=base_vectors.shape[1],
+            k=k, has_filters=False,
+        )
+        pure_results = run_comparison(
+            conn_params, args.table, pure_queries, gt_pure_ids,
+            k, pure_profile, cache_mode=args.cache_mode,
+        )
+        all_results.extend(pure_results)
+        sel_key = f"pure_k{k}"
+        results_by_selectivity[sel_key] = pure_results
+        print(summarize_comparison(pure_results))
+
+        # ============================================================
+        # Step 5: Filtered query benchmarks (multiple selectivities)
+        # ============================================================
+        print("\n" + "=" * 60)
+        print(f"Step 5: Filtered query benchmarks (k={k})")
+        print("=" * 60)
+
+        for col, val, label, sel in SELECTIVITY_CONFIGS:
+            results = run_selectivity_benchmark(
+                conn_params, args.table, query_vectors, base_vectors,
+                attributes, k, args.n_queries, args.cache_mode,
+                col, val, label, sel,
+            )
+            all_results.extend(results)
+            sel_key = f"sel_{label}_k{k}"
+            results_by_selectivity[sel_key] = results
+
+    # ================================================================
+    # Step 6: Generate plots
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("Step 6: Generating plots")
+    print("=" * 60)
+    plot_dir = os.path.join(args.output_dir, "plots")
+    plots = generate_all_plots(all_results, plot_dir)
+    for p in plots:
+        print(f"  Saved: {p}")
+
+    # Generate selectivity heatmap if we have multiple selectivity levels
+    filtered_sel_keys = {
+        k: v for k, v in results_by_selectivity.items()
+        if k.startswith("sel_")
+    }
+    if filtered_sel_keys:
+        for metric in ["recall", "completion_rate"]:
+            p = plot_selectivity_heatmap(
+                filtered_sel_keys, metric=metric, output_dir=plot_dir,
+                filename=f"selectivity_{metric}_heatmap.png",
+            )
+            if p:
+                print(f"  Saved: {p}")
+
+    # ================================================================
+    # Step 7: Save results
+    # ================================================================
+    results_file = os.path.join(args.output_dir, "benchmark_results.json")
+    serializable = []
+    for r in all_results:
+        d = {
+            "config_name": r.config_name,
+            "index_type": r.index_type,
+            "index_params": r.index_params,
+            "query_params": r.query_params,
+            "recall": r.recall,
+            "latency_p50_ms": r.latency_p50_ms,
+            "latency_p95_ms": r.latency_p95_ms,
+            "latency_p99_ms": r.latency_p99_ms,
+            "latency_mean_ms": r.latency_mean_ms,
+            "build_time_s": r.build_time_s,
+            "memory_mb": r.memory_mb,
+            "disk_mb": r.disk_mb,
+            "completion_rate": r.completion_rate,
+            "num_queries": r.num_queries,
+            "k": r.k,
+            "filter_selectivity": r.filter_selectivity,
+        }
+        serializable.append(d)
+
+    with open(results_file, "w") as f:
+        json.dump(serializable, f, indent=2)
+    print(f"\nResults saved to {results_file}")
+
+    # ================================================================
+    # Summary
+    # ================================================================
+    print("\n" + "=" * 60)
+    print("BENCHMARK COMPLETE")
+    print("=" * 60)
+    print(f"Total configurations tested: {len(all_results)}")
+    print(f"K values: {k_values}")
+    print(f"Selectivity levels: pure, {', '.join(s[2] for s in SELECTIVITY_CONFIGS)}")
+    print(f"Results: {results_file}")
+    print(f"Plots: {plot_dir}/")
+
+
+if __name__ == "__main__":
+    main()
