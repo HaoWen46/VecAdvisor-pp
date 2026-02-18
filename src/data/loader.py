@@ -10,6 +10,12 @@ import urllib.request
 
 import numpy as np
 
+try:
+    import vecadvisor_rs as _rs
+    _RUST_AVAILABLE = True
+except ImportError:
+    _RUST_AVAILABLE = False
+
 
 SIFT1M_URL = "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz"
 SIFT1M_FILENAME = "sift.tar.gz"
@@ -19,7 +25,10 @@ def _read_fvecs(filepath: str) -> np.ndarray:
     """Read vectors from fvecs format file.
 
     fvecs format: each vector is stored as [dim (4 bytes int)] [dim floats (4 bytes each)].
+    Uses Rust-accelerated parser if vecadvisor_rs is available.
     """
+    if _RUST_AVAILABLE:
+        return _rs.read_fvecs(filepath)
     vectors = []
     with open(filepath, "rb") as f:
         while True:
@@ -33,7 +42,12 @@ def _read_fvecs(filepath: str) -> np.ndarray:
 
 
 def _read_ivecs(filepath: str) -> np.ndarray:
-    """Read integer vectors from ivecs format file (used for ground truth indices)."""
+    """Read integer vectors from ivecs format file (used for ground truth indices).
+
+    Uses Rust-accelerated parser if vecadvisor_rs is available.
+    """
+    if _RUST_AVAILABLE:
+        return _rs.read_ivecs(filepath)
     vectors = []
     with open(filepath, "rb") as f:
         while True:

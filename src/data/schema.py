@@ -12,6 +12,12 @@ import psycopg2
 from pgvector.psycopg2 import register_vector
 from psycopg2.extras import execute_values
 
+try:
+    import vecadvisor_rs as _rs
+    _RUST_AVAILABLE = True
+except ImportError:
+    _RUST_AVAILABLE = False
+
 
 @dataclass
 class IndexConfig:
@@ -116,20 +122,32 @@ def insert_vectors(
 
             for start in range(0, n, batch_size):
                 end = min(start + batch_size, n)
-                rows = []
-                for i in range(start, end):
-                    row = [vectors[i].tolist()]
-                    for col in attributes:
-                        val = attributes[col][i]
-                        # Convert numpy types to Python native types
-                        if isinstance(val, (np.integer,)):
-                            val = int(val)
-                        elif isinstance(val, (np.floating,)):
-                            val = float(val)
-                        elif isinstance(val, (np.bool_,)):
-                            val = bool(val)
-                        row.append(val)
-                    rows.append(tuple(row))
+                if _RUST_AVAILABLE:
+                    # Rust: build all rows for this batch in one call, avoiding
+                    # per-element Python object allocation (128M floats for 1M vecs)
+                    rows = _rs.build_insert_rows(
+                        np.ascontiguousarray(vectors[start:end], dtype=np.float32),
+                        np.asarray(attributes["category_10"][start:end], dtype=np.int64),
+                        np.asarray(attributes["category_100"][start:end], dtype=np.int64),
+                        np.asarray(attributes["category_1000"][start:end], dtype=np.int64),
+                        np.asarray(attributes["price"][start:end], dtype=np.float64),
+                        np.asarray(attributes["is_active"][start:end], dtype=np.uint8),
+                    )
+                else:
+                    rows = []
+                    for i in range(start, end):
+                        row = [vectors[i].tolist()]
+                        for col in attributes:
+                            val = attributes[col][i]
+                            # Convert numpy types to Python native types
+                            if isinstance(val, (np.integer,)):
+                                val = int(val)
+                            elif isinstance(val, (np.floating,)):
+                                val = float(val)
+                            elif isinstance(val, (np.bool_,)):
+                                val = bool(val)
+                            row.append(val)
+                        rows.append(tuple(row))
 
                 execute_values(
                     cur,

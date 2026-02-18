@@ -8,6 +8,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
+try:
+    import vecadvisor_rs as _rs
+    _RUST_AVAILABLE = True
+except ImportError:
+    _RUST_AVAILABLE = False
+
 
 @dataclass
 class BenchmarkResult:
@@ -46,6 +52,12 @@ def compute_recall(
     Returns:
         Mean recall@k across all queries (0.0 to 1.0).
     """
+    if _RUST_AVAILABLE:
+        return _rs.compute_recall(
+            result_ids,
+            np.asarray(ground_truth_ids, dtype=np.int64),
+            k,
+        )
     total_recall = 0.0
     n_queries = len(result_ids)
 
