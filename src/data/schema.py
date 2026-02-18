@@ -14,7 +14,9 @@ from psycopg2.extras import execute_values
 
 try:
     import vecadvisor_rs as _rs
-    _RUST_AVAILABLE = True
+    # Guard against the vecadvisor_rs/ source directory being imported as a
+    # namespace package (e.g. on servers where the .so hasn't been built yet).
+    _RUST_AVAILABLE = hasattr(_rs, "build_insert_rows")
 except ImportError:
     _RUST_AVAILABLE = False
 
