@@ -23,13 +23,13 @@ This project is grounded in modern DBMS research:
 ### Setup
 
 ```bash
-# 1. Create and activate virtual environment (MANDATORY)
+# 1. Create virtual environment with uv
 cd /path/to/VecAdvisor++
-python3 -m venv venv
-source venv/bin/activate
+uv venv --python 3.11
+source .venv/bin/activate
 
 # 2. Install dependencies
-pip install -r requirements.txt
+uv pip install -r requirements.txt
 
 # 3. Set up the database
 bash scripts/setup_db.sh

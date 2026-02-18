@@ -77,16 +77,14 @@ def compute_filtered_ground_truth(
 
     distances, local_indices = index.search(query_vectors, actual_k)
 
-    # Map local indices back to original base_vectors indices
+    # Map local indices back to original base_vectors indices (vectorized)
     nq = query_vectors.shape[0]
     global_indices = np.full((nq, k), -1, dtype=np.int64)
     global_distances = np.full((nq, k), np.inf, dtype=np.float32)
 
-    for i in range(nq):
-        for j in range(actual_k):
-            if local_indices[i, j] >= 0:
-                global_indices[i, j] = passing_indices[local_indices[i, j]]
-                global_distances[i, j] = distances[i, j]
+    valid = local_indices[:, :actual_k] >= 0
+    global_indices[:, :actual_k][valid] = passing_indices[local_indices[:, :actual_k][valid]]
+    global_distances[:, :actual_k][valid] = distances[:, :actual_k][valid]
 
     return global_distances, global_indices
 

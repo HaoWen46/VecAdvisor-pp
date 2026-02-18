@@ -412,9 +412,9 @@ Our results directly confirm and extend the ICDE 2024 findings:
 
 ```bash
 cd VecAdvisor++
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+uv venv --python 3.11
+source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
 
 ### 9.2 Database Setup
