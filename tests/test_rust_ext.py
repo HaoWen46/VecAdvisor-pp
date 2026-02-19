@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     import vecadvisor_rs as rs
-    RUST_AVAILABLE = True
+    RUST_AVAILABLE = hasattr(rs, "read_fvecs")
 except ImportError:
     RUST_AVAILABLE = False
 
