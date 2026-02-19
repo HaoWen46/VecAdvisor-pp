@@ -7,13 +7,14 @@
 #   bash scripts/setup_remote.sh
 #
 # What it does:
+#   0. Downloads PostgreSQL server binaries if missing (from Arch archive)
 #   1. Initialises a personal PostgreSQL 18 cluster at $PGDATA (port 15432)
 #   2. Compiles and installs pgvector from source
 #   3. Installs Rust toolchain + maturin, builds vecadvisor_rs extension
 #   4. Downloads SIFT1M and GIST1M datasets
 #
 # No credentials are stored in this script. The PostgreSQL cluster uses
-# OS-level peer authentication (your Unix user = DB superuser).
+# OS-level trust authentication (initdb default).
 # =============================================================================
 set -euo pipefail
 
@@ -23,6 +24,60 @@ PGPORT=15432
 PGDB=vecadvisor
 PROJECT_DIR=$REMOTE_BASE/VecAdvisor-pp
 DATA_DIR=$REMOTE_BASE/data
+PG_SERVER_DIR=$REMOTE_BASE/pg_server
+
+# ---------------------------------------------------------------------------
+# Step 0: Ensure PostgreSQL server binaries are available
+# ---------------------------------------------------------------------------
+# On Arch Linux, server tools (initdb, pg_ctl, postgres) live in the
+# 'postgresql' package, which may not be installed system-wide. We download
+# the Arch package from the archive and extract binaries locally.
+# ---------------------------------------------------------------------------
+echo ""
+echo "--- Step 0: PostgreSQL server binaries ---"
+
+_ensure_pg_server_binaries() {
+    if command -v initdb &>/dev/null; then
+        echo "initdb found in PATH: $(which initdb)"
+        return
+    fi
+
+    if [ -x "$PG_SERVER_DIR/usr/bin/initdb" ]; then
+        echo "Using previously extracted PostgreSQL server binaries."
+        return
+    fi
+
+    echo "PostgreSQL server binaries not found. Downloading Arch package..."
+    mkdir -p "$PG_SERVER_DIR"
+
+    # Match the installed postgresql-libs version for ICU compatibility.
+    # The system has postgresql-libs 18.0-1 which links against ICU 76.
+    # We must download a package built against the same ICU version.
+    local pkg_url="https://archive.archlinux.org/packages/p/postgresql/postgresql-18.0-1-x86_64.pkg.tar.zst"
+    curl -L -o "$PG_SERVER_DIR/postgresql.pkg.tar.zst" "$pkg_url"
+
+    local fsize
+    fsize=$(stat -c%s "$PG_SERVER_DIR/postgresql.pkg.tar.zst" 2>/dev/null || echo 0)
+    if [ "$fsize" -lt 1000000 ]; then
+        echo "ERROR: Download too small ($fsize bytes). Check the URL."
+        exit 1
+    fi
+
+    cd "$PG_SERVER_DIR"
+    tar --use-compress-program=unzstd -xf postgresql.pkg.tar.zst
+    echo "Extracted PostgreSQL server binaries to $PG_SERVER_DIR/usr/bin/"
+    cd "$PROJECT_DIR"
+}
+
+_ensure_pg_server_binaries
+
+# Add extracted PG binaries and libs to environment
+if [ -d "$PG_SERVER_DIR/usr/bin" ]; then
+    export PATH="$PG_SERVER_DIR/usr/bin:$PATH"
+fi
+if [ -d "$PG_SERVER_DIR/usr/lib" ]; then
+    export LD_LIBRARY_PATH="${PG_SERVER_DIR}/usr/lib:${LD_LIBRARY_PATH:-}"
+fi
 
 echo "==================================================================="
 echo " VecAdvisor++ Remote Setup"
@@ -30,6 +85,8 @@ echo " REMOTE_BASE : $REMOTE_BASE"
 echo " PGDATA      : $PGDATA"
 echo " PGPORT      : $PGPORT"
 echo " PROJECT_DIR : $PROJECT_DIR"
+echo " initdb      : $(which initdb)"
+echo " pg_ctl      : $(which pg_ctl)"
 echo "==================================================================="
 
 # ---------------------------------------------------------------------------
@@ -73,12 +130,12 @@ echo "postgresql.conf patched."
 if pg_ctl -D "$PGDATA" status > /dev/null 2>&1; then
     echo "PostgreSQL already running."
 else
-    pg_ctl -D "$PGDATA" -l "$REMOTE_BASE/pg.log" start
+    pg_ctl -D "$PGDATA" -l "$REMOTE_BASE/pg.log" start -w -t 60
     echo "PostgreSQL started. Logs: $REMOTE_BASE/pg.log"
 fi
 
 # Create database (idempotent)
-createdb -h localhost -p "$PGPORT" "$PGDB" 2>/dev/null \
+createdb -h "$PGDATA" -p "$PGPORT" "$PGDB" 2>/dev/null \
     && echo "Database '$PGDB' created." \
     || echo "Database '$PGDB' already exists."
 
@@ -90,41 +147,55 @@ echo "--- Step 2: pgvector ---"
 
 PGVECTOR_DIR=$REMOTE_BASE/pgvector
 
+# We need a pg_config wrapper because the system pg_config reports paths
+# that don't exist (server headers are in our extracted package, not in
+# /usr/include/postgresql/server). The wrapper redirects path queries.
+PG_CONFIG_WRAPPER=$PG_SERVER_DIR/pg_config_wrapper.sh
+
+cat > "$PG_CONFIG_WRAPPER" <<'WRAPPER'
+#!/usr/bin/env bash
+PG_BASE=/tmp2/b11902156/pg_server/usr
+case "$1" in
+    --pgxs)              echo "$PG_BASE/lib/postgresql/pgxs/src/makefiles/pgxs.mk" ;;
+    --includedir-server) echo "$PG_BASE/include/postgresql/server" ;;
+    --includedir)        echo "$PG_BASE/include" ;;
+    --pkgincludedir)     echo "$PG_BASE/include/postgresql" ;;
+    --pkglibdir)         echo "$PG_BASE/lib/postgresql" ;;
+    --sharedir)          echo "$PG_BASE/share/postgresql" ;;
+    --libdir)            echo "$PG_BASE/lib" ;;
+    --bindir)            echo "$PG_BASE/bin" ;;
+    --docdir)            echo "$PG_BASE/share/doc/postgresql" ;;
+    --htmldir)           echo "$PG_BASE/share/doc/postgresql" ;;
+    --localedir)         echo "$PG_BASE/share/locale" ;;
+    --mandir)            echo "$PG_BASE/share/man" ;;
+    --sysconfdir)        echo "$PG_BASE/etc/postgresql" ;;
+    *)                   /usr/bin/pg_config "$@" ;;
+esac
+WRAPPER
+chmod +x "$PG_CONFIG_WRAPPER"
+
 if [ ! -d "$PGVECTOR_DIR" ]; then
-    # Try v0.8.0 first; fall back to main if PG 18 requires a newer version
-    git clone --branch v0.8.0 https://github.com/pgvector/pgvector.git "$PGVECTOR_DIR" \
-        || git clone https://github.com/pgvector/pgvector.git "$PGVECTOR_DIR"
+    # Use main branch (v0.8.0 has API incompatibility with PG 18)
+    git clone https://github.com/pgvector/pgvector.git "$PGVECTOR_DIR"
 fi
 
 cd "$PGVECTOR_DIR"
-# Attempt standard install (writes to /usr/lib/postgresql — may need sudo)
-if make PG_CONFIG=/usr/bin/pg_config 2>&1; then
-    if make install PG_CONFIG=/usr/bin/pg_config 2>&1; then
-        echo "pgvector installed to system PG lib dir."
-    else
-        # Fall back to DESTDIR install + dynamic_library_path
-        PGVEC_INSTALL=$REMOTE_BASE/pgvector_install
-        make install DESTDIR="$PGVEC_INSTALL" PG_CONFIG=/usr/bin/pg_config
-        LIB_PATH=$PGVEC_INSTALL/usr/lib/postgresql
-
-        patch_conf "dynamic_library_path" "'$LIB_PATH:\$libdir'"
-        echo "pgvector installed to $LIB_PATH and dynamic_library_path patched."
-
-        # Reload config so the new path is active
-        pg_ctl -D "$PGDATA" reload
-    fi
-else
-    echo "ERROR: pgvector 'make' failed. Check that postgresql-devel headers are installed."
-    echo "You may need: pacman -S postgresql"
-    exit 1
-fi
+make PG_CONFIG="$PG_CONFIG_WRAPPER" 2>&1
+make install PG_CONFIG="$PG_CONFIG_WRAPPER" 2>&1
+echo "pgvector compiled and installed."
 
 cd "$PROJECT_DIR"
+
+# Tell PostgreSQL where to find vector.so
+patch_conf "dynamic_library_path" "'$PG_SERVER_DIR/usr/lib/postgresql:\$libdir'"
+
+# Restart to pick up dynamic_library_path
+pg_ctl -D "$PGDATA" restart -w -t 60 -l "$REMOTE_BASE/pg.log"
 
 psql -h localhost -p "$PGPORT" "$PGDB" \
     -c "CREATE EXTENSION IF NOT EXISTS vector;" \
     && echo "pgvector extension enabled." \
-    || echo "WARNING: Could not create pgvector extension. Check the error above."
+    || echo "WARNING: Could not create pgvector extension."
 
 # ---------------------------------------------------------------------------
 # Step 3: Rust toolchain + vecadvisor_rs
@@ -132,18 +203,21 @@ psql -h localhost -p "$PGPORT" "$PGDB" \
 echo ""
 echo "--- Step 3: Rust + vecadvisor_rs ---"
 
-# uv (Python package manager) — should already be installed
+# uv (Python package manager)
 if ! command -v uv &>/dev/null; then
     source "$HOME/.local/bin/env" 2>/dev/null || true
 fi
 
 # Rust
 if ! command -v cargo &>/dev/null; then
+    source "$HOME/.cargo/env" 2>/dev/null || true
+fi
+
+if ! command -v cargo &>/dev/null; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --quiet
     source "$HOME/.cargo/env"
     echo "Rust installed."
 else
-    source "$HOME/.cargo/env" 2>/dev/null || true
     echo "Rust already installed: $(rustc --version)"
 fi
 
@@ -164,7 +238,7 @@ echo "--- Step 4: Datasets ---"
 
 mkdir -p "$DATA_DIR/sift1m" "$DATA_DIR/gist1m"
 
-# SIFT1M — delegated to Python loader
+# SIFT1M (~500 MB) — via Python loader
 python - <<'PYEOF'
 import sys; sys.path.insert(0, ".")
 from src.data.loader import download_sift1m
@@ -191,13 +265,20 @@ echo ""
 echo "==================================================================="
 echo " Setup complete!"
 echo ""
-echo " PostgreSQL: localhost:$PGPORT  db=$PGDB"
-echo " PGDATA    : $PGDATA"
-echo " Data      : $DATA_DIR"
+echo " PostgreSQL : localhost:$PGPORT  db=$PGDB"
+echo " PGDATA     : $PGDATA"
+echo " Data       : $DATA_DIR"
 echo ""
-echo " To run a smoke test:"
+echo " Before running experiments, set your environment:"
+echo ""
+echo "   export PATH=$PG_SERVER_DIR/usr/bin:\$PATH"
+echo "   export LD_LIBRARY_PATH=$PG_SERVER_DIR/usr/lib:\$LD_LIBRARY_PATH"
 echo "   export PGDATA=$PGDATA"
 echo "   source $PROJECT_DIR/.venv/bin/activate"
+echo "   source \$HOME/.cargo/env"
+echo "   source \$HOME/.local/bin/env"
+echo ""
+echo " Smoke test:"
 echo "   python scripts/run_benchmark.py --config config/remote.yaml \\"
 echo "       --n-base 10000 --n-queries 100 --k 10"
 echo "==================================================================="
