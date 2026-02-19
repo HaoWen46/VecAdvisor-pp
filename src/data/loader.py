@@ -22,6 +22,9 @@ except ImportError:
 SIFT1M_URL = "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz"
 SIFT1M_FILENAME = "sift.tar.gz"
 
+GIST1M_URL = "ftp://ftp.irisa.fr/local/texmex/corpus/gist.tar.gz"
+GIST1M_FILENAME = "gist.tar.gz"
+
 
 def _read_fvecs(filepath: str) -> np.ndarray:
     """Read vectors from fvecs format file.
@@ -115,6 +118,81 @@ def load_sift1m(
         f"queries={query_vectors.shape}, gt={ground_truth_ids.shape}"
     )
     return base_vectors, query_vectors, ground_truth_ids
+
+
+def load_fvecs_dataset(
+    data_dir: str,
+    prefix: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Generic loader for any fvecs-format ANN benchmark dataset.
+
+    Expects files inside data_dir named:
+        {prefix}_base.fvecs, {prefix}_query.fvecs, {prefix}_groundtruth.ivecs
+
+    Args:
+        data_dir: Directory containing the dataset files.
+        prefix: Filename prefix (e.g. "sift", "gist").
+
+    Returns:
+        Tuple of (base_vectors, query_vectors, ground_truth_ids).
+    """
+    base_vectors = _read_fvecs(os.path.join(data_dir, f"{prefix}_base.fvecs"))
+    query_vectors = _read_fvecs(os.path.join(data_dir, f"{prefix}_query.fvecs"))
+    ground_truth_ids = _read_ivecs(os.path.join(data_dir, f"{prefix}_groundtruth.ivecs"))
+    print(
+        f"Loaded {prefix}: base={base_vectors.shape}, "
+        f"queries={query_vectors.shape}, gt={ground_truth_ids.shape}"
+    )
+    return base_vectors, query_vectors, ground_truth_ids
+
+
+def download_gist1m(data_dir: str) -> None:
+    """Download and extract the GIST1M dataset if not already present.
+
+    GIST1M: 1,000,000 base vectors × 960 dimensions (GIST descriptors).
+    1,000 query vectors, 100 ground-truth neighbours each.
+    ~3.6 GB on disk after extraction.
+
+    Args:
+        data_dir: Directory to store the dataset files.
+    """
+    os.makedirs(data_dir, exist_ok=True)
+
+    gist_dir = os.path.join(data_dir, "gist")
+    if os.path.isdir(gist_dir) and os.path.isfile(
+        os.path.join(gist_dir, "gist_base.fvecs")
+    ):
+        print(f"GIST1M dataset already exists at {gist_dir}")
+        return
+
+    archive_path = os.path.join(data_dir, GIST1M_FILENAME)
+    if not os.path.isfile(archive_path):
+        print(f"Downloading GIST1M from {GIST1M_URL} (~3.6 GB, this may take a while)...")
+        urllib.request.urlretrieve(GIST1M_URL, archive_path)
+        print("Download complete.")
+
+    print("Extracting GIST1M archive ...")
+    with tarfile.open(archive_path, "r:gz") as tar:
+        tar.extractall(path=data_dir)
+    print(f"Extraction complete. Files at {gist_dir}")
+
+
+def load_gist1m(
+    data_dir: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load the GIST1M dataset from disk.
+
+    Args:
+        data_dir: Root directory containing the extracted 'gist/' folder.
+
+    Returns:
+        Tuple of (base_vectors, query_vectors, ground_truth_ids):
+            - base_vectors: (1_000_000, 960) float32
+            - query_vectors: (1_000, 960) float32
+            - ground_truth_ids: (1_000, 100) int32 — true NN indices
+    """
+    gist_dir = os.path.join(data_dir, "gist")
+    return load_fvecs_dataset(gist_dir, "gist")
 
 
 def load_subset(

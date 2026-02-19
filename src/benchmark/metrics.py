@@ -19,7 +19,11 @@ except ImportError:
 
 @dataclass
 class BenchmarkResult:
-    """Aggregated benchmark results for a single configuration."""
+    """Aggregated benchmark results for a single configuration.
+
+    When num_runs > 1, the primary fields (recall, latency_*, completion_rate)
+    hold the mean across runs and the *_std fields hold the standard deviation.
+    """
 
     config_name: str
     index_type: str
@@ -37,6 +41,14 @@ class BenchmarkResult:
     num_queries: int
     k: int
     filter_selectivity: float | None = None
+    # Multi-run standard deviations (0.0 when num_runs == 1)
+    recall_std: float = 0.0
+    latency_p50_std: float = 0.0
+    latency_p95_std: float = 0.0
+    latency_p99_std: float = 0.0
+    latency_mean_std: float = 0.0
+    completion_rate_std: float = 0.0
+    num_runs: int = 1
 
 
 def compute_recall(

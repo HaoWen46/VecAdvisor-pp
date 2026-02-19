@@ -32,9 +32,12 @@ def get_default_baselines(n_vectors: int = 1_000_000) -> list[BaselineConfig]:
 
     Returns:
         List of baseline configs:
-        1. pgvector defaults
-        2. Common heuristic settings
-        3. IVFFlat defaults
+        1. pgvector_default      — HNSW with pgvector defaults (m=16, ef_search=40)
+        2. heuristic_hnsw        — HNSW with common hand-tuned settings
+        3. hnsw_aggressive       — HNSW with very high ef_search (shows HNSW ceiling)
+        4. pgvector_ivfflat_default — IVFFlat with sqrt(n) lists, sqrt(lists) probes
+        5. ivfflat_full_probes   — IVFFlat scanning all partitions (IVFFlat ceiling)
+        6. sequential_scan       — No index, brute-force sequential scan (recall upper bound)
     """
     import math
 
@@ -59,12 +62,36 @@ def get_default_baselines(n_vectors: int = 1_000_000) -> list[BaselineConfig]:
             query_params={"ef_search": 100},
         ),
         BaselineConfig(
+            name="hnsw_aggressive",
+            index_config=IndexConfig(
+                index_type="hnsw",
+                params={"m": 16, "ef_construction": 128},
+            ),
+            query_params={"ef_search": 500},
+        ),
+        BaselineConfig(
             name="pgvector_ivfflat_default",
             index_config=IndexConfig(
                 index_type="ivfflat",
                 params={"lists": ivfflat_lists},
             ),
             query_params={"probes": ivfflat_probes},
+        ),
+        BaselineConfig(
+            name="ivfflat_full_probes",
+            index_config=IndexConfig(
+                index_type="ivfflat",
+                params={"lists": ivfflat_lists},
+            ),
+            query_params={"probes": ivfflat_lists},
+        ),
+        BaselineConfig(
+            name="sequential_scan",
+            index_config=IndexConfig(
+                index_type="none",
+                params={},
+            ),
+            query_params={},
         ),
     ]
 
@@ -79,6 +106,7 @@ def run_comparison(
     baselines: list[BaselineConfig] | None = None,
     cache_mode: str = "warm",
     filter_selectivity: float | None = None,
+    num_runs: int = 1,
 ) -> list[BenchmarkResult]:
     """Run comparison benchmarks for baselines and advisor recommendation.
 
@@ -92,6 +120,7 @@ def run_comparison(
         baselines: List of baseline configs (None = use defaults).
         cache_mode: "cold" or "warm".
         filter_selectivity: Selectivity for reporting.
+        num_runs: Number of query-phase repetitions per config (for error bars).
 
     Returns:
         List of BenchmarkResults, last one is VecAdvisor++ recommendation.
@@ -115,10 +144,12 @@ def run_comparison(
             config_name=baseline.name,
             cache_mode=cache_mode,
             filter_selectivity=filter_selectivity,
+            num_runs=num_runs,
         )
         results.append(result)
+        std_str = f" ±{result.recall_std:.4f}" if result.num_runs > 1 else ""
         print(
-            f"  Recall: {result.recall:.4f}, "
+            f"  Recall: {result.recall:.4f}{std_str}, "
             f"p95: {result.latency_p95_ms:.2f}ms, "
             f"Completion: {result.completion_rate:.2%}"
         )
@@ -143,10 +174,12 @@ def run_comparison(
         config_name="vecadvisor++",
         cache_mode=cache_mode,
         filter_selectivity=filter_selectivity,
+        num_runs=num_runs,
     )
     results.append(advisor_result)
+    std_str = f" ±{advisor_result.recall_std:.4f}" if advisor_result.num_runs > 1 else ""
     print(
-        f"  Recall: {advisor_result.recall:.4f}, "
+        f"  Recall: {advisor_result.recall:.4f}{std_str}, "
         f"p95: {advisor_result.latency_p95_ms:.2f}ms, "
         f"Completion: {advisor_result.completion_rate:.2%}"
     )

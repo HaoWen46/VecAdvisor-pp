@@ -234,6 +234,27 @@ def drop_index(conn, index_name: str) -> None:
     conn.commit()
 
 
+def drop_all_vector_indexes(conn, table_name: str) -> None:
+    """Drop all HNSW and IVFFlat vector indexes on a table.
+
+    Used by the sequential_scan baseline to ensure no vector index
+    is present, forcing PostgreSQL to perform a full sequential scan.
+
+    Args:
+        conn: psycopg2 connection.
+        table_name: Table whose vector indexes should be dropped.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename = %s "
+            "AND (indexdef LIKE '%%hnsw%%' OR indexdef LIKE '%%ivfflat%%');",
+            (table_name,),
+        )
+        for row in cur.fetchall():
+            cur.execute(f"DROP INDEX IF EXISTS {row[0]};")
+    conn.commit()
+
+
 def create_btree_index(conn, table_name: str, column: str) -> str:
     """Create a B-tree index on a filter attribute column.
 

@@ -6,11 +6,19 @@ against VecAdvisor++ recommendations across multiple selectivity
 levels and k values.
 
 Usage:
+    # Local quick test
     python scripts/run_benchmark.py --config config/default.yaml \
-        --n-base 100000 --n-queries 500 --k 10
+        --n-base 10000 --n-queries 100 --k 10
 
-    # Full sweep across k values and selectivities:
-    python scripts/run_benchmark.py --n-base 100000 --n-queries 500 --full-sweep
+    # Full SIFT1M on remote server (5 runs for error bars)
+    python scripts/run_benchmark.py --config config/remote.yaml \
+        --n-base 1000000 --n-queries 1000 --full-sweep --num-runs 5 \
+        --dataset sift1m --output-dir results/sift1m_full
+
+    # GIST1M on remote server
+    python scripts/run_benchmark.py --config config/remote.yaml \
+        --n-base 1000000 --n-queries 1000 --full-sweep --num-runs 5 \
+        --dataset gist1m --output-dir results/gist1m_full
 """
 
 import argparse
@@ -23,7 +31,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import yaml
 
-from src.data.loader import download_sift1m, load_sift1m, load_subset
+from src.data.loader import (
+    download_gist1m,
+    download_sift1m,
+    load_gist1m,
+    load_sift1m,
+    load_subset,
+)
 from src.data.schema import (
     create_vector_table,
     generate_synthetic_attributes,
@@ -63,9 +77,38 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _result_to_dict(r) -> dict:
+    return {
+        "config_name": r.config_name,
+        "index_type": r.index_type,
+        "index_params": r.index_params,
+        "query_params": r.query_params,
+        "recall": r.recall,
+        "recall_std": r.recall_std,
+        "latency_p50_ms": r.latency_p50_ms,
+        "latency_p50_std": r.latency_p50_std,
+        "latency_p95_ms": r.latency_p95_ms,
+        "latency_p95_std": r.latency_p95_std,
+        "latency_p99_ms": r.latency_p99_ms,
+        "latency_p99_std": r.latency_p99_std,
+        "latency_mean_ms": r.latency_mean_ms,
+        "latency_mean_std": r.latency_mean_std,
+        "build_time_s": r.build_time_s,
+        "memory_mb": r.memory_mb,
+        "disk_mb": r.disk_mb,
+        "completion_rate": r.completion_rate,
+        "completion_rate_std": r.completion_rate_std,
+        "num_queries": r.num_queries,
+        "num_runs": r.num_runs,
+        "k": r.k,
+        "filter_selectivity": r.filter_selectivity,
+    }
+
+
 def run_selectivity_benchmark(
     conn_params, table_name, query_vectors, base_vectors,
-    attributes, k, n_queries, cache_mode, col, val, label, sel,
+    attributes, k, n_queries, cache_mode, num_runs,
+    col, val, label, sel,
 ):
     """Run a single selectivity-level benchmark."""
     mask = build_filter_mask(attributes, col, val)
@@ -89,7 +132,7 @@ def run_selectivity_benchmark(
     results = run_comparison(
         conn_params, table_name, queries, gt_ids,
         k, profile, cache_mode=cache_mode,
-        filter_selectivity=sel,
+        filter_selectivity=sel, num_runs=num_runs,
     )
     print(summarize_comparison(results))
     return results
@@ -101,6 +144,8 @@ def main():
     )
     parser.add_argument("--config", default="config/default.yaml",
                         help="Config file path")
+    parser.add_argument("--dataset", choices=["sift1m", "gist1m"], default="sift1m",
+                        help="Dataset to use (default: sift1m)")
     parser.add_argument("--n-base", type=int, default=10000,
                         help="Number of base vectors to use")
     parser.add_argument("--n-queries", type=int, default=100,
@@ -111,6 +156,8 @@ def main():
                         help="Table name")
     parser.add_argument("--cache-mode", choices=["cold", "warm"],
                         default="warm", help="Cache mode")
+    parser.add_argument("--num-runs", type=int, default=1,
+                        help="Number of query-phase repetitions per config (for error bars)")
     parser.add_argument("--output-dir", default="results",
                         help="Output directory for results")
     parser.add_argument("--skip-load", action="store_true",
@@ -122,10 +169,14 @@ def main():
     config = load_config(args.config)
     conn_params = config["database"]
 
+    # num_runs: CLI flag takes precedence; fall back to config file value
+    num_runs = args.num_runs
+    if num_runs == 1 and config.get("benchmark", {}).get("num_runs", 1) > 1:
+        num_runs = config["benchmark"]["num_runs"]
+
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "plots"), exist_ok=True)
 
-    # Determine k values to test
     if args.full_sweep:
         k_values = config["benchmark"].get("k_values", [1, 10, 50, 100])
     else:
@@ -135,15 +186,31 @@ def main():
     # Step 1: Load dataset
     # ================================================================
     print("=" * 60)
-    print("Step 1: Loading dataset")
+    print(f"Step 1: Loading {args.dataset.upper()} dataset")
     print("=" * 60)
-    data_dir = config["dataset"]["data_dir"]
-    download_sift1m(data_dir)
-    base_vectors, query_vectors, _ = load_sift1m(data_dir)
+
+    dataset_cfg = config.get("dataset", {})
+
+    if args.dataset == "sift1m":
+        data_dir = dataset_cfg.get("data_dir", "data/sift1m")
+        download_sift1m(data_dir)
+        base_vectors, query_vectors, _ = load_sift1m(data_dir)
+    elif args.dataset == "gist1m":
+        # Allow overriding data_dir via config; default to sibling gist1m dir
+        default_gist_dir = os.path.join(
+            os.path.dirname(dataset_cfg.get("data_dir", "data/sift1m")), "gist1m"
+        )
+        data_dir = dataset_cfg.get("gist_data_dir", default_gist_dir)
+        download_gist1m(data_dir)
+        base_vectors, query_vectors, _ = load_gist1m(data_dir)
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
     base_vectors, query_vectors = load_subset(
         base_vectors, query_vectors, args.n_base, args.n_queries
     )
-    print(f"Using {len(base_vectors)} base vectors, {len(query_vectors)} queries")
+    print(f"Using {len(base_vectors)} base vectors ({base_vectors.shape[1]}-dim), "
+          f"{len(query_vectors)} queries")
 
     # ================================================================
     # Step 2: Load into PostgreSQL
@@ -157,13 +224,17 @@ def main():
         try:
             create_vector_table(conn, args.table, dim, with_attributes=True)
             attributes = generate_synthetic_attributes(len(base_vectors))
+            batch_size = config.get("benchmark", {}).get("batch_size", 1000)
             insert_vectors(conn, args.table, base_vectors, attributes,
-                           batch_size=config["benchmark"]["batch_size"])
+                           batch_size=batch_size)
             print(f"Inserted {len(base_vectors)} vectors into '{args.table}'")
         finally:
             conn.close()
     else:
         attributes = generate_synthetic_attributes(len(base_vectors))
+
+    if num_runs > 1:
+        print(f"\n(Each config will run {num_runs}x for error bars)")
 
     all_results = []
     results_by_selectivity = {}
@@ -174,7 +245,7 @@ def main():
         print("#" * 60)
 
         # ============================================================
-        # Step 3: Compute ground truth for this k
+        # Step 3: Ground truth
         # ============================================================
         print("\n" + "=" * 60)
         print(f"Step 3: Computing ground truth (k={k})")
@@ -197,15 +268,14 @@ def main():
         )
         pure_results = run_comparison(
             conn_params, args.table, pure_queries, gt_pure_ids,
-            k, pure_profile, cache_mode=args.cache_mode,
+            k, pure_profile, cache_mode=args.cache_mode, num_runs=num_runs,
         )
         all_results.extend(pure_results)
-        sel_key = f"pure_k{k}"
-        results_by_selectivity[sel_key] = pure_results
+        results_by_selectivity[f"pure_k{k}"] = pure_results
         print(summarize_comparison(pure_results))
 
         # ============================================================
-        # Step 5: Filtered query benchmarks (multiple selectivities)
+        # Step 5: Filtered query benchmarks
         # ============================================================
         print("\n" + "=" * 60)
         print(f"Step 5: Filtered query benchmarks (k={k})")
@@ -214,12 +284,11 @@ def main():
         for col, val, label, sel in SELECTIVITY_CONFIGS:
             results = run_selectivity_benchmark(
                 conn_params, args.table, query_vectors, base_vectors,
-                attributes, k, args.n_queries, args.cache_mode,
+                attributes, k, args.n_queries, args.cache_mode, num_runs,
                 col, val, label, sel,
             )
             all_results.extend(results)
-            sel_key = f"sel_{label}_k{k}"
-            results_by_selectivity[sel_key] = results
+            results_by_selectivity[f"sel_{label}_k{k}"] = results
 
     # ================================================================
     # Step 6: Generate plots
@@ -232,7 +301,6 @@ def main():
     for p in plots:
         print(f"  Saved: {p}")
 
-    # Generate selectivity heatmap if we have multiple selectivity levels
     filtered_sel_keys = {
         k: v for k, v in results_by_selectivity.items()
         if k.startswith("sel_")
@@ -247,33 +315,11 @@ def main():
                 print(f"  Saved: {p}")
 
     # ================================================================
-    # Step 7: Save results
+    # Step 7: Save results (includes stddev fields)
     # ================================================================
     results_file = os.path.join(args.output_dir, "benchmark_results.json")
-    serializable = []
-    for r in all_results:
-        d = {
-            "config_name": r.config_name,
-            "index_type": r.index_type,
-            "index_params": r.index_params,
-            "query_params": r.query_params,
-            "recall": r.recall,
-            "latency_p50_ms": r.latency_p50_ms,
-            "latency_p95_ms": r.latency_p95_ms,
-            "latency_p99_ms": r.latency_p99_ms,
-            "latency_mean_ms": r.latency_mean_ms,
-            "build_time_s": r.build_time_s,
-            "memory_mb": r.memory_mb,
-            "disk_mb": r.disk_mb,
-            "completion_rate": r.completion_rate,
-            "num_queries": r.num_queries,
-            "k": r.k,
-            "filter_selectivity": r.filter_selectivity,
-        }
-        serializable.append(d)
-
     with open(results_file, "w") as f:
-        json.dump(serializable, f, indent=2)
+        json.dump([_result_to_dict(r) for r in all_results], f, indent=2)
     print(f"\nResults saved to {results_file}")
 
     # ================================================================
@@ -282,8 +328,11 @@ def main():
     print("\n" + "=" * 60)
     print("BENCHMARK COMPLETE")
     print("=" * 60)
+    print(f"Dataset: {args.dataset.upper()}, n={len(base_vectors)}, "
+          f"dim={base_vectors.shape[1]}")
     print(f"Total configurations tested: {len(all_results)}")
     print(f"K values: {k_values}")
+    print(f"Num runs per config: {num_runs}")
     print(f"Selectivity levels: pure, {', '.join(s[2] for s in SELECTIVITY_CONFIGS)}")
     print(f"Results: {results_file}")
     print(f"Plots: {plot_dir}/")
