@@ -26,6 +26,13 @@ import json
 import os
 import sys
 
+# Limit Faiss/OpenBLAS thread count to avoid resource spikes that can kill
+# SSH sessions on shared servers. The default (all cores) causes issues on
+# 32-core machines. Set before importing numpy/faiss.
+os.environ.setdefault("OMP_NUM_THREADS", "8")
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "8")
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
