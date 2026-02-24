@@ -95,7 +95,19 @@ def main():
 
     runner = BenchmarkRunner(conn_params)
     advisor = VecAdvisor()
-    all_records = []
+
+    # Load any previously saved records so incremental saves don't lose old sweeps
+    out_file = os.path.join(args.output_dir, "sensitivity_results.json")
+    if os.path.exists(out_file):
+        with open(out_file) as f:
+            all_records: list = json.load(f)
+        print(f"Loaded {len(all_records)} existing records from {out_file}")
+    else:
+        all_records = []
+
+    def _save_records() -> None:
+        with open(out_file, "w") as f:
+            json.dump(all_records, f, indent=2)
 
     # ------------------------------------------------------------------
     # Pre-compute ground truth for each selectivity
@@ -177,6 +189,8 @@ def main():
             )
             if p:
                 print(f"    Saved: {p}")
+        _save_records()
+        print(f"  Sweep 1 records saved to {out_file}")
 
     # ------------------------------------------------------------------
     # Sweep 2: IVFFlat probes  (fixed lists = sqrt(n))
@@ -220,6 +234,8 @@ def main():
             )
             if p:
                 print(f"    Saved: {p}")
+        _save_records()
+        print(f"  Sweep 2 records saved to {out_file}")
 
     # ------------------------------------------------------------------
     # Sweep 3: IVFFlat lists  (probes = sqrt(lists) each time)
@@ -260,11 +276,9 @@ def main():
         print(f"  Saved: {p}")
 
     # ------------------------------------------------------------------
-    # Save all records
+    # Save all records (final save after Sweep 3)
     # ------------------------------------------------------------------
-    out_file = os.path.join(args.output_dir, "sensitivity_results.json")
-    with open(out_file, "w") as f:
-        json.dump(all_records, f, indent=2)
+    _save_records()
     print(f"\nAll sensitivity results saved to {out_file}")
 
 
