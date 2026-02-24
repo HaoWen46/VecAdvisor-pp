@@ -65,6 +65,8 @@ def main():
     parser.add_argument("--table", default="vectors_sensitivity")
     parser.add_argument("--output-dir", default="results/sensitivity")
     parser.add_argument("--skip-load", action="store_true")
+    parser.add_argument("--start-sweep", type=int, default=1, choices=[1, 2, 3],
+                        help="Resume from this sweep number (1=HNSW ef_search, 2=IVFFlat probes, 3=IVFFlat lists)")
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -137,81 +139,87 @@ def main():
     # ------------------------------------------------------------------
     # Sweep 1: HNSW ef_search
     # ------------------------------------------------------------------
-    print("\n=== Sweep 1: HNSW ef_search ===")
-    hnsw_index = IndexConfig("hnsw", {"m": 16, "ef_construction": 128})
+    if args.start_sweep > 1:
+        print("\n=== Sweep 1: HNSW ef_search (SKIPPED) ===")
+    else:
+        print("\n=== Sweep 1: HNSW ef_search ===")
+        hnsw_index = IndexConfig("hnsw", {"m": 16, "ef_construction": 128})
 
-    for col, val, label, sel in SELECTIVITY_CONFIGS:
-        print(f"\n  Selectivity: {label}")
-        sweep_data = []
-        gt = gt_cache[label]
-        qs = query_cache[label]
+        for col, val, label, sel in SELECTIVITY_CONFIGS:
+            print(f"\n  Selectivity: {label}")
+            sweep_data = []
+            gt = gt_cache[label]
+            qs = query_cache[label]
 
-        for ef in HNSW_EF_SEARCH_VALUES:
-            result = runner.run_full_benchmark(
-                args.table, qs, hnsw_index,
-                query_params={"ef_search": ef},
-                ground_truth_ids=gt, k=k,
-                config_name=f"hnsw_ef{ef}",
-                cache_mode="warm", num_runs=args.num_runs,
-                filter_selectivity=sel if col else None,
+            for ef in HNSW_EF_SEARCH_VALUES:
+                result = runner.run_full_benchmark(
+                    args.table, qs, hnsw_index,
+                    query_params={"ef_search": ef},
+                    ground_truth_ids=gt, k=k,
+                    config_name=f"hnsw_ef{ef}",
+                    cache_mode="warm", num_runs=args.num_runs,
+                    filter_selectivity=sel if col else None,
+                )
+                sweep_data.append((float(ef), result))
+                all_records.append({
+                    "sweep": "hnsw_ef_search", "selectivity": label,
+                    "param_value": ef, "recall": result.recall, "recall_std": result.recall_std,
+                    "latency_p95_ms": result.latency_p95_ms, "latency_p95_std": result.latency_p95_std,
+                })
+                print(f"    ef_search={ef:5d}  recall={result.recall:.4f}  p95={result.latency_p95_ms:.2f}ms")
+
+            advisor_val = _get_advisor_value("hnsw", "ef_search", sel, col)
+            p = plot_pareto_sweep(
+                sweep_data, param_name="ef_search",
+                advisor_value=advisor_val,
+                output_dir=os.path.join(args.output_dir, "plots"),
+                filename=f"hnsw_ef_search_{label}.png",
             )
-            sweep_data.append((float(ef), result))
-            all_records.append({
-                "sweep": "hnsw_ef_search", "selectivity": label,
-                "param_value": ef, "recall": result.recall, "recall_std": result.recall_std,
-                "latency_p95_ms": result.latency_p95_ms, "latency_p95_std": result.latency_p95_std,
-            })
-            print(f"    ef_search={ef:5d}  recall={result.recall:.4f}  p95={result.latency_p95_ms:.2f}ms")
-
-        advisor_val = _get_advisor_value("hnsw", "ef_search", sel, col)
-        p = plot_pareto_sweep(
-            sweep_data, param_name="ef_search",
-            advisor_value=advisor_val,
-            output_dir=os.path.join(args.output_dir, "plots"),
-            filename=f"hnsw_ef_search_{label}.png",
-        )
-        if p:
-            print(f"    Saved: {p}")
+            if p:
+                print(f"    Saved: {p}")
 
     # ------------------------------------------------------------------
     # Sweep 2: IVFFlat probes  (fixed lists = sqrt(n))
     # ------------------------------------------------------------------
-    print(f"\n=== Sweep 2: IVFFlat probes (lists={ivfflat_lists_fixed}) ===")
-    ivfflat_index = IndexConfig("ivfflat", {"lists": ivfflat_lists_fixed})
+    if args.start_sweep > 2:
+        print(f"\n=== Sweep 2: IVFFlat probes (SKIPPED) ===")
+    else:
+        print(f"\n=== Sweep 2: IVFFlat probes (lists={ivfflat_lists_fixed}) ===")
+        ivfflat_index = IndexConfig("ivfflat", {"lists": ivfflat_lists_fixed})
 
-    for col, val, label, sel in SELECTIVITY_CONFIGS:
-        print(f"\n  Selectivity: {label}")
-        sweep_data = []
-        gt = gt_cache[label]
-        qs = query_cache[label]
+        for col, val, label, sel in SELECTIVITY_CONFIGS:
+            print(f"\n  Selectivity: {label}")
+            sweep_data = []
+            gt = gt_cache[label]
+            qs = query_cache[label]
 
-        for probes in IVFFLAT_PROBES_VALUES:
-            probes_capped = min(probes, ivfflat_lists_fixed)
-            result = runner.run_full_benchmark(
-                args.table, qs, ivfflat_index,
-                query_params={"probes": probes_capped},
-                ground_truth_ids=gt, k=k,
-                config_name=f"ivf_probes{probes_capped}",
-                cache_mode="warm", num_runs=args.num_runs,
-                filter_selectivity=sel if col else None,
+            for probes in IVFFLAT_PROBES_VALUES:
+                probes_capped = min(probes, ivfflat_lists_fixed)
+                result = runner.run_full_benchmark(
+                    args.table, qs, ivfflat_index,
+                    query_params={"probes": probes_capped},
+                    ground_truth_ids=gt, k=k,
+                    config_name=f"ivf_probes{probes_capped}",
+                    cache_mode="warm", num_runs=args.num_runs,
+                    filter_selectivity=sel if col else None,
+                )
+                sweep_data.append((float(probes_capped), result))
+                all_records.append({
+                    "sweep": "ivfflat_probes", "selectivity": label,
+                    "param_value": probes_capped, "recall": result.recall, "recall_std": result.recall_std,
+                    "latency_p95_ms": result.latency_p95_ms, "latency_p95_std": result.latency_p95_std,
+                })
+                print(f"    probes={probes_capped:5d}  recall={result.recall:.4f}  p95={result.latency_p95_ms:.2f}ms")
+
+            advisor_val = _get_advisor_value("ivfflat", "probes", sel, col)
+            p = plot_pareto_sweep(
+                sweep_data, param_name="probes",
+                advisor_value=advisor_val,
+                output_dir=os.path.join(args.output_dir, "plots"),
+                filename=f"ivfflat_probes_{label}.png",
             )
-            sweep_data.append((float(probes_capped), result))
-            all_records.append({
-                "sweep": "ivfflat_probes", "selectivity": label,
-                "param_value": probes_capped, "recall": result.recall, "recall_std": result.recall_std,
-                "latency_p95_ms": result.latency_p95_ms, "latency_p95_std": result.latency_p95_std,
-            })
-            print(f"    probes={probes_capped:5d}  recall={result.recall:.4f}  p95={result.latency_p95_ms:.2f}ms")
-
-        advisor_val = _get_advisor_value("ivfflat", "probes", sel, col)
-        p = plot_pareto_sweep(
-            sweep_data, param_name="probes",
-            advisor_value=advisor_val,
-            output_dir=os.path.join(args.output_dir, "plots"),
-            filename=f"ivfflat_probes_{label}.png",
-        )
-        if p:
-            print(f"    Saved: {p}")
+            if p:
+                print(f"    Saved: {p}")
 
     # ------------------------------------------------------------------
     # Sweep 3: IVFFlat lists  (probes = sqrt(lists) each time)
