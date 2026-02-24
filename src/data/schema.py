@@ -217,7 +217,8 @@ def create_index(
         conn.commit()
 
         # Ensure sufficient maintenance_work_mem for index builds
-        cur.execute("SET maintenance_work_mem = '2GB';")
+        # Use 8GB to handle large IVFFlat builds (lists=4000 needs ~3.2 GB)
+        cur.execute("SET maintenance_work_mem = '8GB';")
 
         start = time.perf_counter()
         cur.execute(sql)
